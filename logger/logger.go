@@ -1,10 +1,8 @@
-// Package logger provides structured, leveled logging built on top of zap.
-// When a logger is retrieved via FromContext it automatically attaches the
-// correlation ID and trace ID stored in that context as log fields.
 package logger
 
 import (
 	"context"
+	"sync"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -14,42 +12,39 @@ type contextKey string
 
 const loggerKey contextKey = "obskit_logger"
 
-// ctxFields is a function type so the logger package can pull correlation and
-// trace values without importing those packages (which would create a cycle).
-// Register your extractors once at process startup via RegisterContextFields.
-var ctxFields []func(context.Context) zap.Field
+var (
+	ctxMu     sync.RWMutex
+	ctxFields []func(context.Context) zap.Field
 
-// RegisterContextFields appends field extractors that are called every time
-// FromContext returns a logger. Use this to auto-attach correlation IDs, trace
-// IDs, or any other per-request value from context.
+	defaultOnce   sync.Once
+	defaultLogger *Logger
+)
+
 func RegisterContextFields(fn ...func(context.Context) zap.Field) {
+	ctxMu.Lock()
 	ctxFields = append(ctxFields, fn...)
+	ctxMu.Unlock()
 }
 
-// Logger wraps zap.Logger with context-aware helpers.
 type Logger struct {
 	z *zap.Logger
 }
 
-// Config controls logger initialisation.
 type Config struct {
-	Level      string // debug, info, warn, error  (default: "info")
-	JSON       bool   // true = JSON lines, false = console  (default: true)
+	Level      string
+	JSON       bool
 	AddCaller  bool
 	StackTrace bool
 }
 
-// New creates a Logger from Config.
 func New(cfg Config) (*Logger, error) {
 	if cfg.Level == "" {
 		cfg.Level = "info"
 	}
-
 	level, err := zapcore.ParseLevel(cfg.Level)
 	if err != nil {
 		level = zapcore.InfoLevel
 	}
-
 	var zapCfg zap.Config
 	if cfg.JSON {
 		zapCfg = zap.NewProductionConfig()
@@ -61,7 +56,6 @@ func New(cfg Config) (*Logger, error) {
 	if !cfg.StackTrace {
 		zapCfg.DisableStacktrace = true
 	}
-
 	z, err := zapCfg.Build()
 	if err != nil {
 		return nil, err
@@ -69,30 +63,40 @@ func New(cfg Config) (*Logger, error) {
 	return &Logger{z: z}, nil
 }
 
-// Default returns a ready-to-use JSON/info logger.
-func Default() *Logger {
-	l, _ := New(Config{Level: "info", JSON: true, AddCaller: true})
+// Must panics if err is non-nil. Intended for use at process startup:
+//
+//	log := logger.Must(logger.New(cfg))
+func Must(l *Logger, err error) *Logger {
+	if err != nil {
+		panic("obskit/logger: " + err.Error())
+	}
 	return l
 }
 
-// WithContext stores the logger in ctx so child components can retrieve it.
+func Default() *Logger {
+	defaultOnce.Do(func() {
+		defaultLogger = Must(New(Config{Level: "info", JSON: true, AddCaller: true}))
+	})
+	return defaultLogger
+}
+
 func (l *Logger) WithContext(ctx context.Context) context.Context {
 	return context.WithValue(ctx, loggerKey, l)
 }
 
-// FromContext retrieves the logger stored by WithContext and enriches it with
-// any fields registered via RegisterContextFields (e.g. correlation_id,
-// trace_id). Falls back to Default() if no logger is in ctx.
 func FromContext(ctx context.Context) *Logger {
 	base := Default()
 	if l, ok := ctx.Value(loggerKey).(*Logger); ok {
 		base = l
 	}
-	if len(ctxFields) == 0 {
+	ctxMu.RLock()
+	fns := ctxFields
+	ctxMu.RUnlock()
+	if len(fns) == 0 {
 		return base
 	}
-	fields := make([]zap.Field, 0, len(ctxFields))
-	for _, fn := range ctxFields {
+	fields := make([]zap.Field, 0, len(fns))
+	for _, fn := range fns {
 		if f := fn(ctx); f.Key != "" {
 			fields = append(fields, f)
 		}
@@ -103,24 +107,12 @@ func FromContext(ctx context.Context) *Logger {
 	return &Logger{z: base.z.With(fields...)}
 }
 
-// With returns a child logger with permanent fields.
-func (l *Logger) With(fields ...zap.Field) *Logger {
-	return &Logger{z: l.z.With(fields...)}
-}
-
-// WithFields returns a child logger enriched with key-value pairs.
-func (l *Logger) WithFields(keysAndValues ...any) *Logger {
-	return &Logger{z: l.z.Sugar().With(keysAndValues...).Desugar()}
-}
-
-func (l *Logger) Debug(msg string, fields ...zap.Field) { l.z.Debug(msg, fields...) }
-func (l *Logger) Info(msg string, fields ...zap.Field)  { l.z.Info(msg, fields...) }
-func (l *Logger) Warn(msg string, fields ...zap.Field)  { l.z.Warn(msg, fields...) }
-func (l *Logger) Error(msg string, fields ...zap.Field) { l.z.Error(msg, fields...) }
-func (l *Logger) Fatal(msg string, fields ...zap.Field) { l.z.Fatal(msg, fields...) }
-
-// Sync flushes buffered log entries.
-func (l *Logger) Sync() error { return l.z.Sync() }
-
-// Zap exposes the underlying *zap.Logger for interop.
-func (l *Logger) Zap() *zap.Logger { return l.z }
+func (l *Logger) With(fields ...zap.Field) *Logger     { return &Logger{z: l.z.With(fields...)} }
+func (l *Logger) WithFields(kv ...any) *Logger         { return &Logger{z: l.z.Sugar().With(kv...).Desugar()} }
+func (l *Logger) Debug(msg string, f ...zap.Field)     { l.z.Debug(msg, f...) }
+func (l *Logger) Info(msg string, f ...zap.Field)      { l.z.Info(msg, f...) }
+func (l *Logger) Warn(msg string, f ...zap.Field)      { l.z.Warn(msg, f...) }
+func (l *Logger) Error(msg string, f ...zap.Field)     { l.z.Error(msg, f...) }
+func (l *Logger) Fatal(msg string, f ...zap.Field)     { l.z.Fatal(msg, f...) }
+func (l *Logger) Sync() error                          { return l.z.Sync() }
+func (l *Logger) Zap() *zap.Logger                     { return l.z }

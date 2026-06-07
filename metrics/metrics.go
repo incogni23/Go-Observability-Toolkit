@@ -1,8 +1,7 @@
-// Package metrics exposes Prometheus-backed counters, gauges, histograms, and
-// a default HTTP handler for the /metrics endpoint.
 package metrics
 
 import (
+	"errors"
 	"net/http"
 	"sync"
 
@@ -10,7 +9,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Registry wraps a Prometheus registry with convenience factory methods.
 type Registry struct {
 	mu  sync.Mutex
 	reg prometheus.Registerer
@@ -18,9 +16,6 @@ type Registry struct {
 	hnd http.Handler
 }
 
-// New creates an isolated Registry with Go runtime and process collectors
-// pre-registered. Prefer this over Default in libraries and tests to avoid
-// polluting the global prometheus.DefaultRegisterer.
 func New() *Registry {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(
@@ -30,10 +25,6 @@ func New() *Registry {
 	return newRegistry(reg, reg)
 }
 
-// Default is a package-level Registry backed by prometheus.DefaultRegisterer /
-// prometheus.DefaultGatherer — the same registry that the standard
-// promhttp.Handler() exposes. Use it when you want obskit metrics to appear
-// alongside any other Prometheus instrumentation already in the process.
 var Default = newRegistry(prometheus.DefaultRegisterer, prometheus.DefaultGatherer)
 
 func newRegistry(r prometheus.Registerer, g prometheus.Gatherer) *Registry {
@@ -44,26 +35,20 @@ func newRegistry(r prometheus.Registerer, g prometheus.Gatherer) *Registry {
 	}
 }
 
-// Counter registers and returns a *prometheus.CounterVec.
 func (r *Registry) Counter(name, help string, labels ...string) *prometheus.CounterVec {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := prometheus.NewCounterVec(prometheus.CounterOpts{Name: name, Help: help}, labels)
-	r.reg.MustRegister(c)
-	return c
+	return mustOrExisting(r.reg.Register(c), c).(*prometheus.CounterVec)
 }
 
-// Gauge registers and returns a *prometheus.GaugeVec.
 func (r *Registry) Gauge(name, help string, labels ...string) *prometheus.GaugeVec {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	g := prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: name, Help: help}, labels)
-	r.reg.MustRegister(g)
-	return g
+	return mustOrExisting(r.reg.Register(g), g).(*prometheus.GaugeVec)
 }
 
-// Histogram registers and returns a *prometheus.HistogramVec.
-// Pass nil buckets to use prometheus.DefBuckets.
 func (r *Registry) Histogram(name, help string, buckets []float64, labels ...string) *prometheus.HistogramVec {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -75,11 +60,9 @@ func (r *Registry) Histogram(name, help string, buckets []float64, labels ...str
 		Help:    help,
 		Buckets: buckets,
 	}, labels)
-	r.reg.MustRegister(h)
-	return h
+	return mustOrExisting(r.reg.Register(h), h).(*prometheus.HistogramVec)
 }
 
-// Summary registers and returns a *prometheus.SummaryVec.
 func (r *Registry) Summary(name, help string, objectives map[float64]float64, labels ...string) *prometheus.SummaryVec {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -88,9 +71,20 @@ func (r *Registry) Summary(name, help string, objectives map[float64]float64, la
 		Help:       help,
 		Objectives: objectives,
 	}, labels)
-	r.reg.MustRegister(s)
-	return s
+	return mustOrExisting(r.reg.Register(s), s).(*prometheus.SummaryVec)
 }
 
-// HTTPHandler returns the Prometheus /metrics HTTP handler for this registry.
 func (r *Registry) HTTPHandler() http.Handler { return r.hnd }
+
+// mustOrExisting returns the existing collector on AlreadyRegisteredError so
+// that wiring middleware twice does not panic.
+func mustOrExisting(err error, fallback prometheus.Collector) prometheus.Collector {
+	if err == nil {
+		return fallback
+	}
+	var are prometheus.AlreadyRegisteredError
+	if errors.As(err, &are) {
+		return are.ExistingCollector
+	}
+	panic(err)
+}

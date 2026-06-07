@@ -1,10 +1,10 @@
-// Package tracing provides lightweight per-request spans (TraceID, SpanID,
-// ParentID, tags, and wall-clock duration) without requiring a distributed
-// tracing backend. Spans are propagated through context.Context.
 package tracing
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -14,7 +14,6 @@ type contextKey string
 
 const spanKey contextKey = "obskit_span"
 
-// Span represents a single unit of work.
 type Span struct {
 	TraceID   string
 	SpanID    string
@@ -26,7 +25,6 @@ type Span struct {
 	Err       error
 }
 
-// Duration returns how long the span took. Zero until End is called.
 func (s *Span) Duration() time.Duration {
 	if s.EndedAt.IsZero() {
 		return 0
@@ -34,7 +32,6 @@ func (s *Span) Duration() time.Duration {
 	return s.EndedAt.Sub(s.StartedAt)
 }
 
-// SetTag adds or replaces a tag on the span.
 func (s *Span) SetTag(key, value string) {
 	if s.Tags == nil {
 		s.Tags = make(map[string]string)
@@ -42,22 +39,17 @@ func (s *Span) SetTag(key, value string) {
 	s.Tags[key] = value
 }
 
-// End marks the span as finished.
-func (s *Span) End() {
-	s.EndedAt = time.Now()
-}
+func (s *Span) End() { s.EndedAt = time.Now() }
 
-// Finish is an alias for End that also records an error.
 func (s *Span) Finish(err error) {
 	s.Err = err
 	s.End()
 }
 
-// Start creates a new root span and stores it in ctx.
 func Start(ctx context.Context, operation string) (context.Context, *Span) {
 	parent := FromContext(ctx)
 	span := &Span{
-		TraceID:   traceID(parent),
+		TraceID:   newTraceID(parent),
 		SpanID:    uuid.NewString(),
 		Operation: operation,
 		StartedAt: time.Now(),
@@ -69,15 +61,48 @@ func Start(ctx context.Context, operation string) (context.Context, *Span) {
 	return context.WithValue(ctx, spanKey, span), span
 }
 
-// FromContext returns the active span or nil.
 func FromContext(ctx context.Context) *Span {
-	if s, ok := ctx.Value(spanKey).(*Span); ok {
-		return s
-	}
-	return nil
+	s, _ := ctx.Value(spanKey).(*Span)
+	return s
 }
 
-func traceID(parent *Span) string {
+// ExtractTraceparent reads a W3C traceparent header and stores the trace-id
+// and parent-id in a synthetic parent span so that Start inherits them.
+// If the header is absent or malformed the context is returned unchanged.
+func ExtractTraceparent(ctx context.Context, h http.Header) context.Context {
+	v := h.Get("traceparent")
+	if v == "" {
+		return ctx
+	}
+	parts := strings.Split(v, "-")
+	if len(parts) != 4 || parts[0] != "00" {
+		return ctx
+	}
+	traceID, parentID := parts[1], parts[2]
+	if len(traceID) != 32 || len(parentID) != 16 {
+		return ctx
+	}
+	stub := &Span{TraceID: traceID, SpanID: parentID}
+	return context.WithValue(ctx, spanKey, stub)
+}
+
+// InjectTraceparent writes a W3C traceparent header derived from the active
+// span in ctx. No-ops if there is no active span.
+func InjectTraceparent(ctx context.Context, h http.Header) {
+	s := FromContext(ctx)
+	if s == nil {
+		return
+	}
+	// W3C format: 00-<32-hex traceID>-<16-hex spanID>-01
+	traceID := strings.ReplaceAll(s.TraceID, "-", "")
+	spanID := strings.ReplaceAll(s.SpanID, "-", "")
+	if len(spanID) > 16 {
+		spanID = spanID[:16]
+	}
+	h.Set("traceparent", fmt.Sprintf("00-%s-%s-01", traceID, spanID))
+}
+
+func newTraceID(parent *Span) string {
 	if parent != nil {
 		return parent.TraceID
 	}
