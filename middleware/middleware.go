@@ -1,9 +1,9 @@
-// Package middleware provides composable net/http middleware that wires together
-// the obskit correlation, tracing, logging, and metrics packages.
 package middleware
 
 import (
+	"bufio"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -15,8 +15,8 @@ import (
 	"github.com/incogni23/obskit/tracing"
 )
 
-// responseWriter wraps http.ResponseWriter to capture the status code and
-// bytes written without allocating on every request.
+// responseWriter captures status and bytes while delegating Flusher, Hijacker,
+// and Unwrap so SSE, WebSockets, and ResponseController all work correctly.
 type responseWriter struct {
 	http.ResponseWriter
 	status int
@@ -34,10 +34,22 @@ func (rw *responseWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// routePattern returns the registered pattern from the request's context when
-// available (Go 1.22+ net/http sets it via http.PatternKey), falling back to
-// the raw path. Using the pattern instead of r.URL.Path prevents high-cardinality
-// label values for routes like /users/{id}.
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("obskit: underlying ResponseWriter does not implement http.Hijacker")
+	}
+	return h.Hijack()
+}
+
+func (rw *responseWriter) Unwrap() http.ResponseWriter { return rw.ResponseWriter }
+
 func routePattern(r *http.Request) string {
 	if p := r.Pattern; p != "" {
 		return p
@@ -45,8 +57,6 @@ func routePattern(r *http.Request) string {
 	return r.URL.Path
 }
 
-// Correlation injects a correlation ID into the request context and echoes it
-// in the response header.
 func Correlation(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id, r := correlation.FromRequest(r)
@@ -55,41 +65,35 @@ func Correlation(next http.Handler) http.Handler {
 	})
 }
 
-// Tracing starts a span per request, naming it "<METHOD> <pattern>".
+// Tracing starts a span and propagates W3C traceparent on inbound requests.
 func Tracing(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx, span := tracing.Start(r.Context(), fmt.Sprintf("%s %s", r.Method, r.URL.Path))
+		ctx := tracing.ExtractTraceparent(r.Context(), r.Header)
+		ctx, span := tracing.Start(ctx, fmt.Sprintf("%s %s", r.Method, r.URL.Path))
 		defer span.End()
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// Logging logs each request with method, path, status, duration, and
-// correlation ID. It calls logger.FromContext so that registered context-field
-// extractors (correlation_id, trace_id) are automatically attached.
+// Logging stores log in the request context so handlers can call
+// logger.FromContext, then logs each completed request.
 func Logging(log *logger.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			start := time.Now()
 			rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+			r = r.WithContext(log.WithContext(r.Context()))
 			next.ServeHTTP(rw, r)
-			// Use FromContext so correlation_id / trace_id are auto-attached
-			// by any extractors registered via logger.RegisterContextFields.
 			logger.FromContext(r.Context()).Info("http request",
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.Int("status", rw.status),
 				zap.Duration("duration", time.Since(start)),
 			)
-			_ = log // retain the parameter so callers can pass a custom logger;
-			// it is used below if the context carries no logger.
 		})
 	}
 }
 
-// Metrics records request count and duration histograms into the given
-// registry. Route labels use the registered pattern (not the raw path) to
-// avoid Prometheus cardinality explosion on parameterised routes.
 func Metrics(reg *metrics.Registry) func(http.Handler) http.Handler {
 	requests := reg.Counter(
 		"http_requests_total",
@@ -114,7 +118,25 @@ func Metrics(reg *metrics.Registry) func(http.Handler) http.Handler {
 	}
 }
 
-// Chain applies a list of middleware in order (outermost first).
+// Transport returns an http.RoundTripper that injects X-Correlation-ID and
+// W3C traceparent into outbound requests, propagating context across service
+// boundaries.
+func Transport(base http.RoundTripper) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	return roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		r = r.Clone(r.Context())
+		correlation.InjectHeader(r.Context(), r.Header)
+		tracing.InjectTraceparent(r.Context(), r.Header)
+		return base.RoundTrip(r)
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 func Chain(h http.Handler, mws ...func(http.Handler) http.Handler) http.Handler {
 	for i := len(mws) - 1; i >= 0; i-- {
 		h = mws[i](h)

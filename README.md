@@ -13,12 +13,12 @@ go get github.com/incogni23/obskit
 
 | Package | What it does |
 |---|---|
-| `logger` | Structured, leveled logging (zap) with context propagation |
+| `logger` | Structured, leveled logging (zap) with context propagation; auto-attaches `correlation_id`, `trace_id`, `span_id` |
 | `correlation` | Correlation-ID injection via `X-Correlation-ID` header |
-| `tracing` | Lightweight per-request spans with trace/span/parent IDs |
+| `tracing` | Lightweight per-request spans with W3C `traceparent` inbound extraction and outbound injection |
 | `metrics` | Prometheus counters, gauges, histograms, and `/metrics` handler |
 | `health` | Composable liveness (`/healthz`) and readiness (`/readyz`) probes |
-| `middleware` | One-liner HTTP middleware that wires all of the above together |
+| `middleware` | Inbound HTTP middleware chain + outbound `Transport` for cross-service propagation |
 
 ---
 
@@ -29,7 +29,8 @@ import "github.com/incogni23/obskit"
 
 obs := obskit.New(obskit.Config{
     LogLevel: "info",
-    LogJSON:  true,
+    // LogJSON defaults to true (JSON lines). Opt out for local dev:
+    // LogJSON: obskit.LogJSON(false),
 })
 defer obs.Logger.Sync()
 
@@ -133,6 +134,20 @@ Readiness response:
   }
 }
 ```
+
+---
+
+## Outbound propagation
+
+Wrap your HTTP clients so `X-Correlation-ID` and `traceparent` flow to downstream services:
+
+```go
+client := &http.Client{
+    Transport: middleware.Transport(nil), // nil = http.DefaultTransport
+}
+```
+
+The transport reads both values from the request context, so no manual header plumbing is needed.
 
 ---
 

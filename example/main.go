@@ -15,33 +15,22 @@ import (
 func main() {
 	obs := obskit.New(obskit.Config{
 		LogLevel:  "debug",
-		LogJSON:   obskit.LogJSON(false), // pretty console for local dev
+		LogJSON:   obskit.LogJSON(false),
 		LogCaller: true,
 	})
 	defer obs.Logger.Sync()
 
-	// --- Health checks ---
 	obs.Health.Register("database", func(ctx context.Context) health.CheckResult {
-		// replace with a real ping, e.g. db.PingContext(ctx)
-		return health.CheckResult{Status: health.StatusUp, Message: "ok"}
+		return health.CheckResult{Status: health.StatusUp}
 	})
 	obs.Health.Register("cache", health.OK)
 
-	// --- Routes ---
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/hello", func(w http.ResponseWriter, r *http.Request) {
-		// Store the obs logger in ctx so logger.FromContext picks it up;
-		// the middleware has already injected correlation_id and trace_id.
-		ctx := obs.Logger.WithContext(r.Context())
-
-		_, span := tracing.Start(ctx, "hello-handler")
+		ctx, span := tracing.Start(r.Context(), "hello-handler")
 		defer span.End()
-
-		// FromContext enriches the log line with correlation_id and trace_id
-		// automatically via the extractors registered in obskit.New.
 		logger.FromContext(ctx).Info("handling hello request")
-
 		fmt.Fprintln(w, "Hello from obskit!")
 	})
 
@@ -49,10 +38,8 @@ func main() {
 	mux.Handle("/healthz", obs.Health.LivenessHandler())
 	mux.Handle("/readyz", obs.Health.ReadinessHandler())
 
-	handler := obs.Middleware(mux)
-
-	obs.Logger.Info("server starting on :8080")
-	if err := http.ListenAndServe(":8080", handler); err != nil {
+	obs.Logger.Info("listening on :8080")
+	if err := http.ListenAndServe(":8080", obs.Middleware(mux)); err != nil {
 		log.Fatal(err)
 	}
 }
